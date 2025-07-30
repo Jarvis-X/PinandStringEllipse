@@ -1,7 +1,9 @@
 import numpy as np
 from scipy.optimize import fsolve
 import matplotlib.pyplot as plt
-from typing import Callable, List
+from typing import Callable, List, Optional
+import time
+from matplotlib.animation import FuncAnimation
 
 class Ellipse:
     """
@@ -46,7 +48,7 @@ class Ellipse:
         """
         # The lambda function captures the ellipse's properties (p1, p2, d)
         # and returns the result of the ellipse formula for any point C.
-        return lambda C: np.linalg.norm(C - self.p1) + np.linalg.norm(C - self.p2) - self.d
+        return lambda C: float(np.linalg.norm(C - self.p1) + np.linalg.norm(C - self.p2) - self.d)
 
 class Hitch:
     """
@@ -63,9 +65,15 @@ class Hitch:
         """
         self.e1 = e1
         self.e2 = e2
+        
+        # Time the initial calculation
+        start_time = time.perf_counter()
         self.intersections = self._calculate_intersections()
+        end_time = time.perf_counter()
+        print(f"Initial calculation took: {(end_time - start_time) * 1000:.4f} ms")
 
-    def _calculate_intersections(self, initial_guesses_list: List[np.ndarray] = None, num_default_guesses=12) -> np.ndarray:
+
+    def _calculate_intersections(self, initial_guesses_list: 'Optional[List[np.ndarray]]' = None, num_default_guesses=12) -> np.ndarray:
         """
         Finds intersection points by solving the system of ellipse equations.
         It can be seeded with initial guesses for faster convergence.
@@ -88,7 +96,7 @@ class Hitch:
             guesses.extend(initial_guesses_list)
         else:
             center = (self.e1.p1 + self.e1.p2 + self.e2.p1 + self.e2.p2) / 4.0
-            radius = max(np.linalg.norm(self.e1.p1 - center), np.linalg.norm(self.e2.p1 - center)) * 1.5
+            radius = max(float(np.linalg.norm(self.e1.p1 - center)), float(np.linalg.norm(self.e2.p1 - center))) * 1.5
             guesses.append(center)
             for i in range(num_default_guesses):
                 angle = 2 * np.pi * i / num_default_guesses
@@ -102,7 +110,7 @@ class Hitch:
                 solutions.append(solution)
         return np.array(solutions)
 
-    def update(self, p1_new: np.ndarray = None, p2_new: np.ndarray = None, p3_new: np.ndarray = None, p4_new: np.ndarray = None):
+    def update(self, p1_new: Optional[np.ndarray] = None, p2_new: Optional[np.ndarray] = None, p3_new: Optional[np.ndarray] = None, p4_new: Optional[np.ndarray] = None):
         """
         Updates the position of any of the four foci, validates the change,
         and recalculates the intersections iteratively.
@@ -129,71 +137,98 @@ class Hitch:
             raise ValueError(f"Update failed for Ellipse 2: Major axis length ({self.e2.d}) is not greater than new focal distance ({focal_dist2:.4f}).")
 
         # Iteratively update intersections using the old intersections as initial guesses
-        self.intersections = self._calculate_intersections(initial_guesses_list=self.intersections)
+        self.intersections = self._calculate_intersections(initial_guesses_list=[pt for pt in self.intersections])
 
 
 ## Example Usage
 if __name__ == '__main__':
+    # --- Simulation Parameters ---
+    num_steps = 150
+    max_velocity = 0.1 # Max movement per step
+
     # --- Define Initial Ellipses ---
-    ellipse1 = Ellipse(p1=np.array([-2, 0]), p2=np.array([2, 0]), d=5.0)
-    ellipse2 = Ellipse(p1=np.array([0, -3]), p2=np.array([0, 3]), d=7.0)
+    ellipse1 = Ellipse(p1=np.array([-2, 0]), p2=np.array([2, 0]), d=7.0)
+    ellipse2 = Ellipse(p1=np.array([0, -2]), p2=np.array([0, 2]), d=7.0)
 
     # --- Create the Hitch and find initial intersections ---
+    print("--- Initializing Simulation ---")
     hitch = Hitch(e1=ellipse1, e2=ellipse2)
-    initial_intersections = hitch.intersections
-    print("--- Initial State ---")
-    print("Intersection Points Found:")
-    print(initial_intersections)
-
-    # --- Store original ellipses for plotting ---
-    original_e1_p1, original_e1_p2 = hitch.e1.p1.copy(), hitch.e1.p2.copy()
-    original_e2_p1, original_e2_p2 = hitch.e2.p1.copy(), hitch.e2.p2.copy()
-
-    # --- Update the position of one focus ---
-    print("\n--- Updating Focus p1 ---")
-    hitch.update(p1_new=np.array([-3.5, 0.5]))
-    updated_intersections = hitch.intersections
-    print("New Intersection Points Found:")
-    print(updated_intersections)
-
-    # --- Visualization ---
-    fig, ax = plt.subplots(figsize=(9, 9))
-    x_range = np.linspace(-6, 6, 400)
-    y_range = np.linspace(-6, 6, 400)
+    
+    # --- Store history for plotting ---
+    foci_history = [[hitch.e1.p1.copy(), hitch.e1.p2.copy(), hitch.e2.p1.copy(), hitch.e2.p2.copy()]]
+    intersection_history = [hitch.intersections]
+    
+    # --- Set up the plot for animation ---
+    fig, ax = plt.subplots(figsize=(10, 10))
+    x_range = np.linspace(-8, 8, 200)
+    y_range = np.linspace(-8, 8, 200)
     X, Y = np.meshgrid(x_range, y_range)
 
-    # Plot Original Ellipse 1 (dashed blue)
-    Z1_orig = np.sqrt((X - original_e1_p1[0])**2 + (Y - original_e1_p1[1])**2) + \
-              np.sqrt((X - original_e1_p2[0])**2 + (Y - original_e1_p2[1])**2)
-    ax.contour(X, Y, Z1_orig, levels=[hitch.e1.d], colors=['#1f77b4'], linestyles='dashed', alpha=0.7)
+    # This function will be called for each frame of the animation
+    def animate(frame):
+        ax.clear() # Clear the previous frame
 
-    # Plot Original Ellipse 2 (dashed orange)
-    Z2_orig = np.sqrt((X - original_e2_p1[0])**2 + (Y - original_e2_p1[1])**2) + \
-              np.sqrt((X - original_e2_p2[0])**2 + (Y - original_e2_p2[1])**2)
-    ax.contour(X, Y, Z2_orig, levels=[hitch.e2.d], colors=['#ff7f0e'], linestyles='dashed', alpha=0.7)
-    
-    # Plot Updated Ellipse 1 (solid blue)
-    Z1_new = np.sqrt((X - hitch.e1.p1[0])**2 + (Y - hitch.e1.p1[1])**2) + \
-             np.sqrt((X - hitch.e1.p2[0])**2 + (Y - hitch.e1.p2[1])**2)
-    ax.contour(X, Y, Z1_new, levels=[hitch.e1.d], colors=['#1f77b4'], linewidths=2)
+        # --- Update simulation state for the current frame ---
+        if frame > 0: # Don't move on the first frame
+            # Generate random velocities for each focus
+            v1 = (np.random.rand(2) - 0.5) * 2 * max_velocity
+            v2 = (np.random.rand(2) - 0.5) * 2 * max_velocity
+            v3 = (np.random.rand(2) - 0.5) * 2 * max_velocity
+            v4 = (np.random.rand(2) - 0.5) * 2 * max_velocity
+            
+            # Calculate new positions
+            p1_new = hitch.e1.p1 + v1
+            p2_new = hitch.e1.p2 + v2
+            p3_new = hitch.e2.p1 + v3
+            p4_new = hitch.e2.p2 + v4
 
-    # Plot Updated Ellipse 2 (solid orange - unchanged in this example)
-    ax.contour(X, Y, Z2_orig, levels=[hitch.e2.d], colors=['#ff7f0e'], linewidths=2)
+            try:
+                # Update the hitch
+                hitch.update(p1_new, p2_new, p3_new, p4_new)
 
-    # Plot foci and intersections
-    if initial_intersections.size > 0:
-        ax.scatter(initial_intersections[:, 0], initial_intersections[:, 1], c='lightcoral', s=80, zorder=4, label='Initial Intersections')
-    if updated_intersections.size > 0:
-        ax.scatter(updated_intersections[:, 0], updated_intersections[:, 1], c='red', s=80, zorder=5, label='Updated Intersections')
+                # Store results for plotting the trail
+                foci_history.append([p1_new.copy(), p2_new.copy(), p3_new.copy(), p4_new.copy()])
+                intersection_history.append(hitch.intersections)
+            except ValueError as e:
+                print(f"Frame {frame}: Simulation stopped. {e}")
+                # Stop the animation by doing nothing further
+                return
 
-    ax.scatter([original_e1_p1[0], hitch.e1.p1[0]], [original_e1_p1[1], hitch.e1.p1[1]], c='#1f77b4', marker='x', s=100, label='Foci E1 (Orig/New)')
-    ax.scatter(hitch.e1.p2[0], hitch.e1.p2[1], c='#1f77b4', marker='x', s=100)
-    ax.scatter([hitch.e2.p1[0], hitch.e2.p2[0]], [hitch.e2.p1[1], hitch.e2.p2[1]], c='#ff7f0e', marker='x', s=100, label='Foci E2')
+        # --- Redraw everything for the current frame ---
+        current_foci = foci_history[-1]
+        
+        # Plot current ellipses
+        Z1 = np.sqrt((X - current_foci[0][0])**2 + (Y - current_foci[0][1])**2) + np.sqrt((X - current_foci[1][0])**2 + (Y - current_foci[1][1])**2)
+        ax.contour(X, Y, Z1, levels=[hitch.e1.d], colors='#1f77b4', linewidths=2)
+        Z2 = np.sqrt((X - current_foci[2][0])**2 + (Y - current_foci[2][1])**2) + np.sqrt((X - current_foci[3][0])**2 + (Y - current_foci[3][1])**2)
+        ax.contour(X, Y, Z2, levels=[hitch.e2.d], colors='#ff7f0e', linewidths=2)
 
-    ax.set_title('Updating Ellipse Intersections')
-    ax.set_xlabel('x-axis')
-    ax.set_ylabel('y-axis')
-    ax.legend()
-    ax.grid(True, linestyle='--', alpha=0.6)
-    ax.set_aspect('equal', adjustable='box')
+        # Plot trajectories of foci
+        foci_history_np = np.array(foci_history)
+        ax.plot(foci_history_np[:, 0, 0], foci_history_np[:, 0, 1], 'o-', color='#1f77b4', markersize=3, alpha=0.7, label='Foci 1 Path')
+        ax.plot(foci_history_np[:, 1, 0], foci_history_np[:, 1, 1], 'o-', color='#1f77b4', markersize=3, alpha=0.7)
+        ax.plot(foci_history_np[:, 2, 0], foci_history_np[:, 2, 1], 'o-', color='#ff7f0e', markersize=3, alpha=0.7, label='Foci 2 Path')
+        ax.plot(foci_history_np[:, 3, 0], foci_history_np[:, 3, 1], 'o-', color='#ff7f0e', markersize=3, alpha=0.7)
+
+        # Plot trajectory of intersections
+        all_intersections = [p for points in intersection_history if points.size > 0 for p in points]
+        if all_intersections:
+            all_intersections_np = np.array(all_intersections)
+            ax.scatter(all_intersections_np[:, 0], all_intersections_np[:, 1], c='red', s=15, alpha=0.6, zorder=5, label='Intersection Path')
+
+        # Set plot properties for each frame
+        ax.set_title(f'Dynamic Simulation of Ellipse Intersections (Frame {frame+1})')
+        ax.set_xlabel('x-axis')
+        ax.set_ylabel('y-axis')
+        ax.legend(loc='upper left')
+        ax.grid(True, linestyle='--', alpha=0.6)
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xlim(-8, 8)
+        ax.set_ylim(-8, 8)
+
+    # --- Create and run the animation ---
+    print(f"\n--- Starting animation for {num_steps} steps... ---")
+    ani = FuncAnimation(fig, animate, frames=num_steps, interval=50, repeat=False)
     plt.show()
+
+    print("\n--- Animation Finished ---")
