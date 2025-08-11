@@ -164,144 +164,164 @@ class CableRobotSystem:
         for _ in range(steps):
             self.step()
 
+    def _get_ellipse_points(self, f1, f2, major_axis_length):
+        """Calculates points for a 2D ellipse defined by its foci."""
+        center = (f1 + f2) / 2
+        dist = np.linalg.norm(f1 - f2)
+        if dist >= major_axis_length: return None
+        a = major_axis_length / 2.0
+        c = dist / 2.0
+        b = np.sqrt(max(a**2 - c**2, 1e-9))
+        angle = np.arctan2(f2[1] - f1[1], f2[0] - f1[0])
+        t = np.linspace(0, 2 * np.pi, 100)
+        R = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+        points = R @ np.vstack((a * np.cos(t), b * np.sin(t))) + center[:, np.newaxis]
+        return points
+
     def _get_ellipsoid_points(self, f1, f2, major_axis_length):
         """Calculates wireframe points for an ellipsoid defined by its foci."""
-        if self.n != 3: return None, None, None
-        
         center = (f1 + f2) / 2
         dist = np.linalg.norm(f1 - f2)
         if dist >= major_axis_length: return None, None, None
-
         a = major_axis_length / 2.0
         c = dist / 2.0
-        b = np.sqrt(a**2 - c**2)
-
+        b = np.sqrt(max(a**2 - c**2, 1e-9))
         u = np.linspace(0, 2 * np.pi, 20)
         v = np.linspace(0, np.pi, 20)
-        
         x = a * np.outer(np.cos(u), np.sin(v))
         y = b * np.outer(np.sin(u), np.sin(v))
         z = b * np.outer(np.ones_like(u), np.cos(v))
-
-        # Rotation logic
         f1_to_f2 = self._unit_vector(f2 - f1)
         if np.allclose(f1_to_f2, [1, 0, 0]):
             rot_mat = np.identity(3)
         else:
             v_axis = np.cross([1, 0, 0], f1_to_f2)
             s = np.linalg.norm(v_axis)
-            c = np.dot([1, 0, 0], f1_to_f2)
+            c_angle = np.dot([1, 0, 0], f1_to_f2)
             vx = np.array([[0, -v_axis[2], v_axis[1]], [v_axis[2], 0, -v_axis[0]], [-v_axis[1], v_axis[0], 0]])
-            rot_mat = np.identity(3) + vx + vx @ vx * ((1 - c) / (s**2))
-
-        points = np.stack([x, y, z], axis=-1)
-        points = points @ rot_mat.T + center
-        
+            rot_mat = np.identity(3) + vx + vx @ vx * ((1 - c_angle) / (s**2))
+        points = np.stack([x, y, z], axis=-1) @ rot_mat.T + center
         return points[..., 0], points[..., 1], points[..., 2]
 
     def animate(self, frame_skip=0):
         """
-        Creates and displays an animation of the simulation.
-
-        Args:
-            frame_skip (int): The number of frames to skip between each rendered frame.
+        Creates and displays an animation of the simulation for 2D or 3D.
         """
-        if self.n != 3:
-            print("Animation is only supported for n=3.")
-            return
-
         p_hist = np.array(self.history["p"])
         p_i_hist = np.array(self.history["p_i"])
+        tensions_hist = np.array(self.history["tensions"])
         
         fig = plt.figure(figsize=(12, 12))
-        ax = fig.add_subplot(111, projection='3d')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_title("3D Cable Robot Simulation")
-
-        # Set plot limits
-        all_points = np.vstack(self.history['p_i'])
-        ax.set_xlim(all_points[:,0].min()-1, all_points[:,0].max()+1)
-        ax.set_ylim(all_points[:,1].min()-1, all_points[:,1].max()+1)
-        ax.set_zlim(all_points[:,2].min()-1, all_points[:,2].max()+1)
-
-        hitch_point, = ax.plot([], [], [], 'ko', ms=8, zorder=10, label='Hitch Point')
-        robot_colors = ['#d62728', '#2ca02c', '#1f77b4', '#9467bd']
-        robot_dots = [ax.plot([], [], [], 'o', color=c, ms=10)[0] for c in robot_colors]
-        cables = [ax.plot([], [], [], '-', color=c, lw=1.5, alpha=0.8)[0] for c in ['#d62728', '#d62728', '#1f77b4', '#1f77b4']]
-        force_arrows = [ax.plot([], [], [], '-', color=c, lw=2)[0] for c in robot_colors]
-        
-        # Use lists for wireframes to handle removal
-        wireframe1_lines = []
-        wireframe2_lines = []
-
         step = frame_skip + 1
         animation_frames = range(0, len(p_hist), step)
 
-        def update(frame_index):
-            nonlocal wireframe1_lines, wireframe2_lines
-            p = p_hist[frame_index]
-            p_i = p_i_hist[frame_index]
+        if self.n == 3:
+            ax = fig.add_subplot(111, projection='3d')
+            ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+            ax.set_title("3D Cable Robot Simulation")
+            all_points = np.vstack(self.history['p_i'])
+            ax.set_xlim(all_points[:,0].min()-1, all_points[:,0].max()+1)
+            ax.set_ylim(all_points[:,1].min()-1, all_points[:,1].max()+1)
+            ax.set_zlim(all_points[:,2].min()-1, all_points[:,2].max()+1)
 
-            hitch_point.set_data_3d([p[0]], [p[1]], [p[2]])
-            for i in range(4):
-                robot_dots[i].set_data_3d([p_i[i, 0]], [p_i[i, 1]], [p_i[i, 2]])
-                cables[i].set_data_3d([p[0], p_i[i, 0]], [p[1], p_i[i, 1]], [p[2], p_i[i, 2]])
-                
-                start = p_i[i]
-                end = start + 0.5 * self.u[i]
-                force_arrows[i].set_data_3d([start[0], end[0]], [start[1], end[1]], [start[2], end[2]])
+            hitch_point, = ax.plot([], [], [], 'ko', ms=8, zorder=10, label='Hitch Point')
+            robot_colors = ['#d62728', '#2ca02c', '#1f77b4', '#9467bd']
+            robot_dots = [ax.plot([], [], [], 'o', color=c, ms=10)[0] for c in robot_colors]
+            cables = [ax.plot([], [], [], '-', color=c, lw=1.5, alpha=0.8)[0] for c in ['#d62728', '#d62728', '#1f77b4', '#1f77b4']]
+            force_arrows = [ax.plot([], [], [], '-', color=c, lw=2)[0] for c in robot_colors]
+            wireframe1_lines, wireframe2_lines = [], []
 
-            # Remove old wireframes
-            for wf in wireframe1_lines: wf.remove()
-            for wf in wireframe2_lines: wf.remove()
-            wireframe1_lines.clear()
-            wireframe2_lines.clear()
+            def update_3d(frame_index):
+                nonlocal wireframe1_lines, wireframe2_lines
+                p, p_i = p_hist[frame_index], p_i_hist[frame_index]
+                hitch_point.set_data_3d([p[0]], [p[1]], [p[2]])
+                for i in range(4):
+                    robot_dots[i].set_data_3d([p_i[i, 0]], [p_i[i, 1]], [p_i[i, 2]])
+                    cables[i].set_data_3d([p[0], p_i[i, 0]], [p[1], p_i[i, 1]], [p[2], p_i[i, 2]])
+                    start, end = p_i[i], p_i[i] + 0.5 * self.u[i]
+                    force_arrows[i].set_data_3d([start[0], end[0]], [start[1], end[1]], [start[2], end[2]])
+                for wf in wireframe1_lines + wireframe2_lines: wf.remove()
+                wireframe1_lines.clear(); wireframe2_lines.clear()
+                x1, y1, z1 = self._get_ellipsoid_points(p_i[0], p_i[1], self.l12)
+                if x1 is not None: wireframe1_lines.append(ax.plot_wireframe(x1, y1, z1, color='c', alpha=0.2))
+                x2, y2, z2 = self._get_ellipsoid_points(p_i[2], p_i[3], self.l34)
+                if x2 is not None: wireframe2_lines.append(ax.plot_wireframe(x2, y2, z2, color='m', alpha=0.2))
+                return [hitch_point, *robot_dots, *cables, *force_arrows]
             
-            # Draw new wireframes
-            x1, y1, z1 = self._get_ellipsoid_points(p_i[0], p_i[1], self.l12)
-            if x1 is not None:
-                wireframe1_lines.append(ax.plot_wireframe(x1, y1, z1, color='c', alpha=0.3))
-            
-            x2, y2, z2 = self._get_ellipsoid_points(p_i[2], p_i[3], self.l34)
-            if x2 is not None:
-                wireframe2_lines.append(ax.plot_wireframe(x2, y2, z2, color='m', alpha=0.3))
+            ani = FuncAnimation(fig, update_3d, frames=animation_frames, blit=False, interval=50)
 
-            return [hitch_point, *robot_dots, *cables, *force_arrows]
+        elif self.n == 2:
+            ax = fig.add_subplot(111)
+            ax.set_aspect('equal')
+            ax.set_xlabel('X'); ax.set_ylabel('Y')
+            ax.set_title("2D Cable Robot Simulation")
+            ax.grid(True, linestyle='--', alpha=0.6)
+            all_points = np.vstack(self.history['p_i'])
+            ax.set_xlim(all_points[:,0].min()-1, all_points[:,0].max()+1)
+            ax.set_ylim(all_points[:,1].min()-1, all_points[:,1].max()+1)
 
-        ani = FuncAnimation(fig, update, frames=animation_frames, blit=False, interval=50)
+            hitch_point, = ax.plot([], [], 'ko', ms=8, zorder=10, label='Hitch Point')
+            robot_colors = ['#d62728', '#2ca02c', '#1f77b4', '#9467bd']
+            robot_dots = [ax.plot([], [], 'o', color=c, ms=10)[0] for c in robot_colors]
+            cables = [ax.plot([], [], '-', color=c, lw=1.5, alpha=0.8)[0] for c in ['#d62728', '#d62728', '#1f77b4', '#1f77b4']]
+            force_arrows = [ax.add_patch(FancyArrowPatch((0,0), (0,0), color=c, arrowstyle='->', mutation_scale=20, lw=1.5)) for c in robot_colors]
+            tension_texts = [ax.text(0, 0, '', fontsize=9, ha='center', va='center', backgroundcolor=(1,1,1,0.7)) for _ in range(4)]
+            ellipse1_line, = ax.plot([], [], 'c--', lw=1, label='Constraint Ellipse 1-2')
+            ellipse2_line, = ax.plot([], [], 'm--', lw=1, label='Constraint Ellipse 3-4')
+
+            def update_2d(frame_index):
+                p, p_i = p_hist[frame_index], p_i_hist[frame_index]
+                t_arr = tensions_hist[frame_index] if frame_index < len(tensions_hist) else np.zeros(4)
+                hitch_point.set_data([p[0]], [p[1]])
+                for i in range(4):
+                    robot_dots[i].set_data([p_i[i, 0]], [p_i[i, 1]])
+                    cables[i].set_data([p[0], p_i[i, 0]], [p[1], p_i[i, 1]])
+                    mid_point = (p + p_i[i]) / 2
+                    tension_texts[i].set_position((mid_point[0], mid_point[1])); tension_texts[i].set_text(f"{t_arr[i]:.2f} N")
+                    start, end = p_i[i], p_i[i] + 0.5 * self.u[i]
+                    force_arrows[i].set_positions(start, end)
+                ellipse1_pts = self._get_ellipse_points(p_i[0], p_i[1], self.l12)
+                if ellipse1_pts is not None: ellipse1_line.set_data([ellipse1_pts[0]], [ellipse1_pts[1]])
+                ellipse2_pts = self._get_ellipse_points(p_i[2], p_i[3], self.l34)
+                if ellipse2_pts is not None: ellipse2_line.set_data([ellipse2_pts[0]], [ellipse2_pts[1]])
+                return [hitch_point, *robot_dots, *cables, *tension_texts, ellipse1_line, ellipse2_line, *force_arrows]
+
+            ani = FuncAnimation(fig, update_2d, frames=animation_frames, blit=True, interval=2)
+        else:
+            print(f"Animation is not supported for n={self.n}.")
+            return
+        
         plt.show()
 
 def main():
     n = 3 # Switch to 3D
-    dt = 0.005
-    steps = 1000
+    dt = 0.001
+    steps = 10000
 
     p_i0 = np.array([
         [-2.0, -2.5, 0.0],
         [-1.5,  2.0, 0.5],
         [ 1.5,  2.0, -0.5],
         [ 2.0, -2.5, 0.0]
-    ])
+    ])[:, :n]
 
     v_i0 = np.zeros((4, n))
     m = 0.1
     m_i = np.ones(4) * 0.5
     l12 = 6.5
     l34 = 6.5
-    c_d = 0.0 # Damping coefficient
+    c_d = 0.1 # Damping coefficient
 
     sim = CableRobotSystem(p_i0, v_i0, l12, l34, m, m_i, dt, c_d)
 
-    sim.u[0] = np.array([-1.0, -1.0, 0.3])
-    sim.u[1] = np.array([-1.0, 1.0, -0.1])
-    sim.u[2] = np.array([1.0, 1.0, 0.3])
-    sim.u[3] = np.array([1.0, -1.0, 0.0])
-    sim.f_ext = np.array([0.0, 0.0, -0.5])  # External force on the hitch point
+    sim.u[0] = np.array([-1.0, -1.0, 0.3])[:n]
+    sim.u[1] = np.array([-1.0, 1.0, -0.1])[:n]
+    sim.u[2] = np.array([1.0, 1.0, 0.3])[:n]
+    sim.u[3] = np.array([1.0, -1.0, 0.0])[:n]
+    sim.f_ext = np.array([0.0, 0.0, -0.5])[:n]  # External force on the hitch point
 
     sim.run(steps)
-    sim.animate(frame_skip=9)
+    sim.animate(frame_skip=19)
 
 if __name__ == "__main__":
     main()
