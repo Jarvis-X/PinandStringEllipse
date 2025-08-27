@@ -53,7 +53,8 @@ class CableRobotSystem:
         self.history = {
             "p": [self.p.copy()],
             "p_i": [self.p_i.copy()],
-            "tensions": [] # Store tensions for efficient and accurate animation
+            "tensions": [], # Store tensions for efficient and accurate animation
+            "u": [self.u.copy()]
         }
 
     def _constraint_loss(self, p):
@@ -134,30 +135,25 @@ class CableRobotSystem:
 
         return a, a_i, t_per_segment
 
-    def step(self):
-        """Advances the simulation by one time step."""
+    def euler_integrate(self):
         a, a_i, tensions = self._compute_dynamics()
+        v_unprojected = self.v + self.dt * a
+        p_unprojected = self.p + self.dt * v_unprojected
+        v_i = self.v_i + self.dt * a_i
+        p_i = self.p_i + self.dt * v_i
+        return v_unprojected, p_unprojected, v_i, p_i, tensions
 
-        # --- Integration Step ---
-        # Update velocities and positions using Euler integration
-        self.v += self.dt * a
-        p_unprojected = self.p + self.dt * self.v
-        
-        self.v_i += self.dt * a_i
-        self.p_i += self.dt * self.v_i
-        
-        # --- Projection Step ---
-        # Project the hitch point back onto the constraint manifold to correct drift
+    def step(self):
+        v_unprojected, p_unprojected, v_i, p_i, tensions = self.euler_integrate()
+        self.v, self.v_i, self.p_i = v_unprojected, v_i, p_i
         p_corrected = self._solve_initial_p(p_unprojected)
-        
-        # Update velocity based on the correction to maintain physical consistency
-        self.v += (p_corrected - p_unprojected) / self.dt
+        correction = (p_corrected - p_unprojected) / self.dt
+        self.v += 0.5 * correction
         self.p = p_corrected
-
-        # Store results for this step
         self.history["p"].append(self.p.copy())
         self.history["p_i"].append(self.p_i.copy())
         self.history["tensions"].append(tensions.copy())
+        self.history["u"].append(self.u.copy())
 
     def run(self, steps):
         """Runs the simulation for a given number of steps."""
@@ -296,7 +292,7 @@ class CableRobotSystem:
 def main():
     n = 3 # Switch to 3D
     dt = 0.001
-    steps = 10000
+    steps = 20000
 
     p_i0 = np.array([
         [-2.0, -2.5, 0.0],
@@ -309,19 +305,19 @@ def main():
     m = 0.1
     m_i = np.ones(4) * 0.5
     l12 = 6.5
-    l34 = 6.5
+    l34 = 7.5
     c_d = 0.1 # Damping coefficient
 
     sim = CableRobotSystem(p_i0, v_i0, l12, l34, m, m_i, dt, c_d)
 
-    sim.u[0] = np.array([-1.0, -1.0, 0.3])[:n]
-    sim.u[1] = np.array([-1.0, 1.0, -0.1])[:n]
-    sim.u[2] = np.array([1.0, 1.0, 0.3])[:n]
-    sim.u[3] = np.array([1.0, -1.0, 0.0])[:n]
-    sim.f_ext = np.array([0.0, 0.0, -0.5])[:n]  # External force on the hitch point
+    sim.u[0] = np.array([-1.0, -1.0, 0.25])[:n]
+    sim.u[1] = np.array([-1.0, 1.0, 0.25])[:n]
+    sim.u[2] = np.array([1.0, 1.0, 0.25])[:n]
+    sim.u[3] = np.array([1.0, -1.0, 0.25])[:n]
+    sim.f_ext = np.array([0.0, 0.0, -1])[:n]  # External force on the hitch point
 
     sim.run(steps)
-    sim.animate(frame_skip=19)
+    sim.animate(frame_skip=49)
 
 if __name__ == "__main__":
     main()
