@@ -5,10 +5,13 @@ from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import FancyArrowPatch
 import casadi as ca
-import do_mpc
+from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
 
-def _safe_norm(v):
-    return ca.sqrt(ca.sum1(v**2) + 1e-12)
+
+def _safe_norm_cs(v):
+    """CasADi-safe norm with small epsilon to avoid div-by-zero."""
+    return ca.sqrt(ca.sumsqr(v) + 1e-12)
+
 
 class CableRobotSystem:
     """
@@ -112,57 +115,85 @@ class CableRobotSystem:
         self.history["tensions"].append(tensions.copy())
         self.history["u"].append(self.u.copy())
 
-    def build_mpc(
-            self, 
-            p_ref_val, 
-            d12_ref_val, 
-            d34_ref_val, 
-            n_ref_val, 
-            N=10, 
-            dt_mpc=None, 
-            Qp=10.0, 
-            Qshape=1.0, 
-            Qcot=1.0, 
-            Ru=0.1):
-        if ca is None or do_mpc is None: raise ImportError("casadi and do-mpc must be installed.")
-        if dt_mpc is None: dt_mpc = self.dt
+    def build_mpc_acados(self,
+                         N=20,
+                         dt_mpc=None,
+                         Qp=10.0,
+                         Qshape=1.0,
+                         Qcot=0.5,
+                         Ru=1e-3,
+                         t_min=1e-3,
+                         u_bounds=10.0):
+        """
+        Build and cache an ACADOS OCP where tensions are algebraic variables (model.z).
+        The algebraic equality M(x)*t - v0(x,u) = 0 is enforced as the first nh_eq rows
+        of con_h_expr; the positivity constraint t >= t_min is enforced as additional
+        inequality rows (con_h_expr >= 0).
+        """
+        if ca is None or AcadosOcp is None:
+            raise ImportError("CasADi and acados_template (with ACADOS) are required for build_mpc_acados().")
 
+        if dt_mpc is None:
+            dt_mpc = self.dt
         n = self.n
-        model = do_mpc.model.Model('discrete')
+        assert n in (2, 3), "This MPC builder handles n=2 or n=3."
 
-        # --- State variables (unified vector) ---
-        # nx_total = n + 4*n + n + 4*n
-        p = model.set_variable('_x', 'p', (n, 1))
-        p_i = model.set_variable('_x', 'p_i', (n*4, 1))
-        v = model.set_variable('_x', 'v', (n, 1))
-        v_i = model.set_variable('_x', 'v_i', (n*4, 1))
-        # x = model.set_variable('_x', 'x', (nx_total, 1))
-        
-        # idx = 0
-        # p = x[idx:idx+n]; idx += n
-        # p_i = x[idx:idx+4*n]; idx += 4*n
-        # v = x[idx:idx+n]; idx += n
-        # v_i = x[idx:idx+4*n]; idx += 4*n
-        
-        p_i_reshaped = ca.reshape(p_i, (n, 4))
-        v_i_reshaped = ca.reshape(v_i, (n, 4))
+        # ------------ CasADi model ------------
+        model = AcadosModel()
+        model.name = "cable_robot_mpc_dae"
 
-        # --- Control inputs ---
-        u = model.set_variable('_u', 'u', (n*4, 1))
-        u_reshaped = ca.reshape(u, (n, 4))
+        # State x packs positions and velocities:
+        # x = [ p (n), p1 (n), p2 (n), p3 (n), p4 (n),  v (n), v1 (n), v2 (n), v3 (n), v4 (n) ]
+        nx = 10 * n
+        x = ca.SX.sym('x', nx)
 
-        # --- Time-varying parameters ---
-        p_ref = model.set_variable('_tvp', 'p_ref', (n, 1))
-        d12_ref = model.set_variable('_tvp', 'd12_ref', (1, 1))
-        d34_ref = model.set_variable('_tvp', 'd34_ref', (1, 1))
-        n_ref = model.set_variable('_tvp', 'n_ref', (n, 1))
+        # Control u is robot inputs only (n , 4)
+        nu = 4 * n
+        u = ca.SX.sym('u', nu)
+        u_reshaped = ca.reshape(u, n, 4)
 
-        # --- Dynamics ---
-        r = [p - p_i_reshaped[:, i] for i in range(4)]
-        r_mag = [_safe_norm(ri) for ri in r]
-        r_hat = [r[i]/r_mag[i] for i in range(4)]
-        r_dot = [v - v_i_reshaped[:, i] for i in range(4)]
-        r_hat_dot = [(1/r_mag[i] * r_dot[i].T @ (ca.SX.eye(n) - r_hat[i] @ r_hat[i].T)).T for i in range(4)]
+        # Algebraic variables z are tensions t (2,)
+        nz = 2
+        z = ca.SX.sym('z', nz)
+
+        # Parameters: references [p_ref (n), d12_ref, d34_ref]
+        p_par = ca.SX.sym('p_par', n + 2)
+        p_ref = p_par[:n]
+        d12_ref = p_par[n]
+        d34_ref = p_par[n + 1]
+
+        # Unpack x
+        def seg(start, length):
+            return x[start:start + length]
+
+        idx = 0
+        p = seg(idx, n); idx += n
+        p1 = seg(idx, n); idx += n
+        p2 = seg(idx, n); idx += n
+        p3 = seg(idx, n); idx += n
+        p4 = seg(idx, n); idx += n
+        v = seg(idx, n); idx += n
+        v1 = seg(idx, n); idx += n
+        v2 = seg(idx, n); idx += n
+        v3 = seg(idx, n); idx += n
+        v4 = seg(idx, n); idx += n
+        assert idx == nx
+
+        # Controls as n-by-4 matrix
+        t12 = z[0]
+        t34 = z[1]
+
+        Pi = [p1, p2, p3, p4]
+        Vi = [v1, v2, v3, v4]
+
+        r = [p - Pi[i] for i in range(4)]
+        r_mag = [_safe_norm_cs(r[i]) for i in range(4)]
+        r_hat = [r[i] / r_mag[i] for i in range(4)]
+        r_dot = [v - Vi[i] for i in range(4)]
+        r_hat_dot = []
+        for i in range(4):
+            proj = r_hat[i] * (ca.dot(r_hat[i], r_dot[i]))
+            r_hat_dot.append((r_dot[i] - proj) / r_mag[i])
 
         n1, n2 = r_hat[0] + r_hat[1], r_hat[2] + r_hat[3]
         M11 = n1.T @ n1 + self.m*(1/self.m_i[0] + 1/self.m_i[1])
@@ -170,96 +201,161 @@ class CableRobotSystem:
         M12 = n1.T @ n2
         Mmat = ca.vertcat(ca.horzcat(M11, M12), ca.horzcat(M12, M22))
 
+        # v0(x,u) term (keeps higher-order velocity terms and explicit u-dependence)
         term1 = (r_hat[0].T @ u_reshaped[:, 0])/self.m_i[0] + (r_hat[1].T @ u_reshaped[:, 1])/self.m_i[1]
         term2 = (r_hat[2].T @ u_reshaped[:, 2])/self.m_i[2] + (r_hat[3].T @ u_reshaped[:, 3])/self.m_i[3]
         v0_1 = -self.m*(term1 - r_hat_dot[0].T@r_dot[0] - r_hat_dot[1].T@r_dot[1]) - self.c_d*n1.T@v + n1.T@self.f_ext
         v0_2 = -self.m*(term2 - r_hat_dot[2].T@r_dot[2] - r_hat_dot[3].T@r_dot[3]) - self.c_d*n2.T@v + n2.T@self.f_ext
         v0 = ca.vertcat(v0_1, v0_2)
 
+        # Algebraic equality residual: M * t - v0(x,u) = 0
         t_var = ca.solve(Mmat, v0)
         t12, t34 = t_var[0], t_var[1]
 
-        tension_force = -(t12*n1 + t34*n2)
-        a = (tension_force - self.c_d*v + self.f_ext)/self.m
-        a_i = ca.SX(n, 4)
-        for i in range(4): a_i[:, i] = ((ca.if_else(i < 2, t12, t34))*r_hat[i] + u_reshaped[:, i])/self.m_i[i]
+        a = (t_var - self.c_d * v + self.f_ext) / self.m
+        a1 = (t12 * r_hat[0] + u_reshaped[:, 0]) / self.m_i[0]
+        a2 = (t12 * r_hat[1] + u_reshaped[:, 1]) / self.m_i[1]
+        a3 = (t34 * r_hat[2] + u_reshaped[:, 2]) / self.m_i[2]
+        a4 = (t34 * r_hat[3] + u_reshaped[:, 3]) / self.m_i[3]
 
-        p_next = p + dt_mpc*v
-        v_next = v + dt_mpc*a
-        p_i_next = p_i_reshaped + dt_mpc*v_i_reshaped
-        v_i_next = v_i_reshaped + dt_mpc*a_i
+        p_next = p + dt_mpc * v
+        v_next = v + dt_mpc * a
+        p1_next = p1 + dt_mpc * v1
+        p2_next = p2 + dt_mpc * v2
+        p3_next = p3 + dt_mpc * v3
+        p4_next = p4 + dt_mpc * v4
+        v1_next = v1 + dt_mpc * a1
+        v2_next = v2 + dt_mpc * a2
+        v3_next = v3 + dt_mpc * a3
+        v4_next = v4 + dt_mpc * a4
 
-        # x_next = ca.vertcat(p_next, ca.reshape(p_i_next, (n*4, 1)), v_next, ca.reshape(v_i_next, (n*4, 1)))
-        # model.set_rhs('x', x_next)
-        model.set_rhs('p', p_next)
-        model.set_rhs('p_i', ca.reshape(p_i_next, (n*4, 1)))
-        model.set_rhs('v', v_next)
-        model.set_rhs('v_i', ca.reshape(v_i_next, (n*4, 1)))
-        model.setup()
-        
-        # model setup is O.K.
-        mpc = do_mpc.controller.MPC(model)
-        setup_mpc = {
-            'n_horizon': 10,  # Prediction horizon
-            't_step': 100*self.dt,
-            'state_discretization': 'discrete',
-            'open_loop': 0,  # Closed-loop MPC
-            'store_full_solution': False,
-            'state_discretization': 'collocation',
-            'collocation_type': 'radau',
-            'nlpsol_opts': {
-                # 'jit': True,
-                'ipopt.tol': 0.001,
-                'ipopt.max_iter': 1000,
-                'ipopt.print_level': 2, 
-                'ipopt.ma57_automatic_scaling': 'no',  # Enable MA57 auto scaling
-                'ipopt.sb': 'no',  # Enable silent barrier mode
-                'print_time': 0,  # Disable solver timing information
-                'ipopt.linear_solver': 'ma57'  # Use a faster linear solver
-            }
-        }
-        mpc.set_param(**setup_mpc)
+        x_next = ca.vertcat(p_next, p1_next, p2_next, p3_next, p4_next,
+                            v_next, v1_next, v2_next, v3_next, v4_next)
 
-        d12 = _safe_norm(p_i_reshaped[:, 0] - p_i_reshaped[:, 1])
-        d34 = _safe_norm(p_i_reshaped[:, 2] - p_i_reshaped[:, 3])
-        n2_norm2 = n2.T @ n2 + 1e-12
-        proj = (n1.T @ n2 / n2_norm2) * n2
-        e_c = _safe_norm(n1 - proj)
+        model.x = x
+        model.u = u
+        model.z = z
+        model.p = p_par
 
-        lterm = Qp*((p - p_ref).T@(p - p_ref)) + Qshape*(d12 - d12_ref)**2 + Qshape*(d34 - d34_ref)**2 + Qcot*e_c**2
-        mterm = Qp*((p - p_ref).T@(p - p_ref)) + Qshape*(d12 - d12_ref)**2 + Qshape*(d34 - d34_ref)**2
-        print(lterm)
-        print(mterm)
-        mpc.set_objective(mterm=mterm, lterm=lterm)
-        mpc.set_rterm(u=Ru)
+        model.disc_dyn_expr = x_next
 
-        mpc.bounds['lower','_u','u'] = -1*np.ones((n*4, 1))
-        mpc.bounds['upper','_u','u'] = 1*np.ones((n*4, 1))
+        # Costs: build y as in previous version
+        d12 = _safe_norm_cs(p1 - p2)
+        d34 = _safe_norm_cs(p3 - p4)
+        s2_norm2 = n2.T @ n2 + 1e-12
+        proj = (n1.T@n2 / s2_norm2) * n2
+        e_c = _safe_norm_cs(n1 - proj)
 
-        tvp_template = mpc.get_tvp_template()
-        def tvp_fun(t_now):
-            tvp_template['_tvp', 0, 'p_ref'] = p_ref_val
-            tvp_template['_tvp', 0, 'd12_ref'] = d12_ref_val
-            tvp_template['_tvp', 0, 'd34_ref'] = d34_ref_val
-            tvp_template['_tvp', 0, 'n_ref'] = n_ref_val
-            return tvp_template
-        mpc.set_tvp_fun(tvp_fun)
-        mpc.set_nl_cons(f't12constraint', expr=-t12, ub=-1e-3)
-        mpc.set_nl_cons(f't34constraint', expr=-t34, ub=-1e-3)
-        mpc.setup()
-        print("MPC built successfully.")
-        
-        self._do_mpc = {'mpc': mpc}
-        return mpc
+        y_hitch = p - p_ref
+        y_shape = ca.vertcat(d12 - d12_ref, d34 - d34_ref)
+        y_cot = ca.vertcat(e_c)
+        y_u = u
+        y = ca.vertcat(y_hitch, y_shape, y_cot, y_u)
 
-    def controller_mpc_do_mpc(self, mpc):
-        x0 = np.vstack([self.p, self.p_i, self.v, self.v_i]).reshape(-1, 1)
-        try:
-            u_opt = mpc.make_step(x0)
-            return np.asarray(u_opt).reshape(self.n, 4).T
-        except Exception as e:
-            print(f"MPC solve failed; fallback: {e}")
-            return np.zeros((4, self.n))
+        ny = n + 2 + 1 + nu
+        model.cost_y_expr = y
+
+        # ------------- OCP -------------
+        ocp = AcadosOcp()
+        ocp.model = model
+        ocp.dims.N = N
+        ocp.solver_options.tf = N * dt_mpc
+
+        # Weight matrix W
+        W = np.zeros((ny, ny))
+        for i in range(n): W[i, i] = Qp
+        W[n + 0, n + 0] = Qshape
+        W[n + 1, n + 1] = Qshape
+        W[n + 2, n + 2] = Qcot
+        for i in range(nu): W[n + 3 + i, n + 3 + i] = Ru
+
+        ocp.cost.cost_type = 'NONLINEAR_LS'
+        ocp.cost.cost_type_e = 'NONLINEAR_LS'
+        ocp.cost.W = W
+        ocp.cost.W_e = W[:n, :n]
+        ocp.cost.yref = np.zeros(ny)
+        ocp.cost.yref_e = np.zeros(n)
+
+        # Control bounds
+        idxbu = np.arange(nu, dtype=np.int64)
+        lbu = -u_bounds * np.ones(nu)
+        ubu = +u_bounds * np.ones(nu)
+        ocp.constraints.idxbu = idxbu
+        ocp.constraints.lbu = lbu
+        ocp.constraints.ubu = ubu
+
+        # Path constraint bounds for h_constr: first 2 rows equality (0), next 2 rows inequality (>=0)
+        nh = 4
+        ocp.constraints.lh = np.concatenate([np.zeros(2), np.zeros(2)])
+        ocp.constraints.uh = np.concatenate([np.zeros(2), 1e6 * np.ones(2)])
+
+        # Initial state placeholder
+        ocp.constraints.x0 = np.zeros(nx)
+
+        # Solver options
+        ocp.solver_options.qp_solver = 'FULL_CONDENSING_QPOASES'
+        ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
+        ocp.solver_options.integrator_type = 'DISCRETE'
+        ocp.solver_options.nlp_solver_type = 'SQP_RTI'
+        ocp.solver_options.print_level = 0
+        ocp.dims.np = n + 2
+        ocp.parameter_values = np.zeros(n + 2)
+
+        ocp_solver = AcadosOcpSolver(ocp, json_file=f"{model.name}.json")
+
+        # Cache
+        self._acados = {'ocp': ocp, 'solver': ocp_solver, 'N': N, 'dt_mpc': dt_mpc, 'nx': nx, 'nu': nu, 'n': n}
+        return self._acados
+
+    def _pack_state_vector_for_acados(self):
+        n = self.n
+        p = self.p.reshape(-1)
+        p_i = self.p_i.reshape(-1)
+        v = self.v.reshape(-1)
+        v_i = self.v_i.reshape(-1)
+        x = np.concatenate([p,
+                            p_i[0*n:1*n], p_i[1*n:2*n], p_i[2*n:3*n], p_i[3*n:4*n],
+                            v,
+                            v_i[0*n:1*n], v_i[1*n:2*n], v_i[2*n:3*n], v_i[3*n:4*n]])
+        return x
+
+    def controller_mpc_acados(self, p_ref, d12_ref, d34_ref):
+        if ca is None or AcadosOcp is None:
+            raise ImportError("CasADi and acados_template (with ACADOS) are required for controller_mpc_acados().")
+        if not hasattr(self, '_acados'):
+            self.build_mpc_acados()
+
+        solver = self._acados['solver']
+        N = self._acados['N']
+        n = self.n
+
+        x0 = self._pack_state_vector_for_acados()
+        # set initial state equality at node 0
+        solver.set(0, 'lbx', x0)
+        solver.set(0, 'ubx', x0)
+        solver.set(0, 'x', x0)
+
+        # set parameters
+        p_par = np.concatenate([np.asarray(p_ref).reshape(n), [float(d12_ref)], [float(d34_ref)]])
+        for k in range(N):
+            solver.set(k, 'p', p_par)
+        solver.set(N, 'p', p_par)
+
+        # warm start u=0
+        nu = self._acados['nu']
+        for k in range(N):
+            solver.set(k, 'u', np.zeros(nu))
+
+        status = solver.solve()
+        if status != 0:
+            print(f"[ACADOS] solver failed with status {status}. Falling back.")
+            u_cmd, _ = self.controller_positive_tension(p_ref)
+            return u_cmd
+
+        u_opt = solver.get(0, 'u').reshape(-1)
+        u_cmd = u_opt.reshape(4, n)
+        return u_cmd
+
 
     def run(self, steps):
         p_ref_val = np.zeros((self.n, 1))
@@ -267,12 +363,12 @@ class CableRobotSystem:
         d34_ref_val = np.array([[self.l34 * 3/4]])
         n_ref_val = np.array([1.0, 0.0, 0.0])[:self.n].reshape(self.n, 1)
         
-        mpc = self.build_mpc(p_ref_val, d12_ref_val, d34_ref_val, n_ref_val)
-        mpc.set_initial_guess()
+        mpc = self.build_mpc_acados()
+        # mpc.set_initial_guess()
 
         for i in range(steps):
             print(f"Step {i+1}/{steps}")
-            u_cmd = self.controller_mpc_do_mpc(mpc)
+            u_cmd = self.controller_mpc_acados(p_ref_val, d12_ref_val, d34_ref_val)
             self.u[:] = u_cmd
             self.step()
 
