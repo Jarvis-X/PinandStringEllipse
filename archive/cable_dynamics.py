@@ -5,6 +5,7 @@ from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import FancyArrowPatch
 
+
 class CableRobotSystem:
     """
     Simulates the dynamics of a cable-driven robot system based on the paper
@@ -73,13 +74,14 @@ class CableRobotSystem:
         norm = np.linalg.norm(v)
         return v / norm if norm > 1e-9 else np.zeros_like(v)
 
-    def _compute_dynamics(self):
+    def _compute_reduced_dynamics(self):
         """
-        Computes tensions and accelerations based on the system's current state.
-        This method implements the core dynamics described in the paper.
+        Computes tensions and accelerations for the reduced system where robots 2 and 3 are fixed.
+        This implementation is more efficient as it solves a 2x2 linear system for tensions
+        instead of a 4x4 system.
         """
         # Define vectors based on current state (p, v, p_i, v_i)
-        # r points from robot i to the hitch point p.
+        # Note: v_i for fixed robots (1 and 2) is always zero.
         r = np.array([self.p - self.p_i[i] for i in range(4)])
         r_dot = np.array([self.v - self.v_i[i] for i in range(4)])
         r_hat = np.array([self._unit_vector(r[i]) for i in range(4)])
@@ -87,25 +89,19 @@ class CableRobotSystem:
 
         # Derivative of the unit vector r_hat
         r_hat_dot = np.array([(1.0/r_mag[i] * r_dot[i] @ (np.eye(self.n) - np.outer(r_hat[i], r_hat[i]))).ravel() for i in range(4)])
-        
-        # Mass-related term for the tension matrix
-        alpha = self.m * np.array([1/self.m_i[0] + 1/self.m_i[1], 1/self.m_i[2] + 1/self.m_i[3]])
 
-        # Right-hand side term from the paper's affine tension equation
-        def c_term(i):
-            return (1/self.m_i[i]) * r_hat[i] @ self.u[i] - r_hat_dot[i] @ r_dot[i]
+        # Right-hand side terms for the tension equation
+        # For fixed robots (i=1, 2), u_i is zero and v_i is zero.
+        c1 = (1/self.m_i[0]) * r_hat[0] @ self.u[0] - r_hat_dot[0] @ r_dot[0] - r_hat_dot[1] @ r_dot[1]
+        c2 = (1/self.m_i[3]) * r_hat[3] @ self.u[3] - r_hat_dot[3] @ r_dot[3] - r_hat_dot[2] @ r_dot[2]
         
-        c1 = c_term(0) + c_term(1)
-        c2 = c_term(2) + c_term(3)
-
-        # Build and solve the linear system M*t = RHS for tensions
+        # Build and solve the reduced 2x2 linear system M*t = RHS for tensions
         M = np.array([
-            [np.linalg.norm(r_hat[0] + r_hat[1])**2, (r_hat[0] + r_hat[1]) @ (r_hat[2] + r_hat[3])],
-            [(r_hat[2] + r_hat[3]) @ (r_hat[0] + r_hat[1]), np.linalg.norm(r_hat[2] + r_hat[3])**2]
+            [np.linalg.norm(r_hat[0] + r_hat[1])**2 + self.m/self.m_i[0], (r_hat[0] + r_hat[1]) @ (r_hat[2] + r_hat[3])],
+            [(r_hat[2] + r_hat[3]) @ (r_hat[0] + r_hat[1]), np.linalg.norm(r_hat[2] + r_hat[3])**2 + self.m/self.m_i[3]]
         ])
-        M += np.diag(alpha)
-        
-        # Calculate the RHS, now including the effect of the damping force
+
+        # Calculate the RHS, including damping and external forces
         RHS = -self.m * np.array([c1, c2])
         damping_correction = np.array([
             (r_hat[0] + r_hat[1]) @ (self.c_d * self.v),
@@ -126,14 +122,67 @@ class CableRobotSystem:
         t12, t34 = max(0, tensions[0]), max(0, tensions[1])
         t_per_segment = np.array([t12, t12, t34, t34])
 
-        # Calculate accelerations using Newton's second law (Eq. 6 and 7)
+        # Calculate accelerations using Newton's second law
         # Add damping term to the hitch point acceleration
         tension_force = -t12 * (r_hat[0] + r_hat[1]) - t34 * (r_hat[2] + r_hat[3])
         damping_force = -self.c_d * self.v + self.f_ext
         a = (tension_force + damping_force) / self.m
-        a_i = np.array([(t_per_segment[i] * r_hat[i] + self.u[i]) / self.m_i[i] for i in range(4)])
+        
+        # Accelerations for dynamic robots (0 and 3)
+        a_i = np.zeros((4, self.n))
+        a_i[0] = (t_per_segment[0] * r_hat[0] + self.u[0]) / self.m_i[0]
+        a_i[3] = (t_per_segment[3] * r_hat[3] + self.u[3]) / self.m_i[3]
 
         return a, a_i, t_per_segment
+
+    def _compute_dynamics(self):
+        r = np.array([self.p - self.p_i[i] for i in range(4)])
+        r_dot = np.array([self.v - self.v_i[i] for i in range(4)])
+        r_hat = np.array([self._unit_vector(r[i]) for i in range(4)])
+        r_mag = np.linalg.norm(r, axis=1)
+
+
+        r_hat_dot = np.array([(1.0/r_mag[i] * r_dot[i] @ (np.eye(self.n) - np.outer(r_hat[i], r_hat[i]))).ravel() for i in range(4)])
+
+
+        # Build 4x4 M matrix as in the paper
+        n12 = r_hat[0] + r_hat[1]
+        n34 = r_hat[2] + r_hat[3]
+        M = np.array([
+        [np.linalg.norm(n12)**2 + self.m/self.m_i[0] + self.m/self.m_i[1], 0, n12 @ n34, 0],
+        [n34 @ n12, 0, np.linalg.norm(n34)**2 + self.m/self.m_i[2] + self.m/self.m_i[3], 0],
+        [1, -1, 0, 0],
+        [0, 0, 1, -1]
+        ])
+
+
+        # Build v vector
+        v = np.zeros(4)
+        v[0] = -self.m*((r_hat[0] @ self.u[0])/self.m_i[0] + (r_hat[1] @ self.u[1])/self.m_i[1]
+        - r_hat_dot[0] @ r_dot[0] - r_hat_dot[1] @ r_dot[1])
+        v[1] = -self.m*((r_hat[2] @ self.u[2])/self.m_i[2] + (r_hat[3] @ self.u[3])/self.m_i[3]
+        - r_hat_dot[2] @ r_dot[2] - r_hat_dot[3] @ r_dot[3])
+        v[0:2] += -self.c_d * np.array([(n12 @ self.v), (n34 @ self.v)])
+        v[0:2] += np.array([(n12 @ self.f_ext), (n34 @ self.f_ext)])
+
+        try:
+            t = np.linalg.solve(M, v)
+        except np.linalg.LinAlgError:
+            t = np.zeros(4)
+
+        t = np.maximum(t, 0.0)
+
+        # Hitch acceleration (corrected Eq. 8)
+        R = np.column_stack(r_hat)
+        e_d = -self.c_d * self.v
+        a = (-R @ t + e_d + self.f_ext) / self.m
+
+
+        # Robot accelerations
+        a_i = np.array([(t[i] * r_hat[i] + self.u[i]) / self.m_i[i] for i in range(4)])
+
+
+        return a, a_i, t
 
     def euler_integrate(self):
         a, a_i, tensions = self._compute_dynamics()
@@ -290,7 +339,7 @@ class CableRobotSystem:
         plt.show()
 
 def main():
-    n = 3 # Switch to 3D
+    n = 2 # Switch to 3D
     dt = 0.001
     steps = 20000
 
@@ -304,6 +353,8 @@ def main():
     v_i0 = np.zeros((4, n))
     m = 0.1
     m_i = np.ones(4) * 0.5
+    # m_i[1] = np.inf  # Make robot 3 immobile
+    # m_i[2] = np.inf  # Make robot 4 immobile
     l12 = 6.5
     l34 = 7.5
     c_d = 0.1 # Damping coefficient
