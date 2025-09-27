@@ -8,6 +8,13 @@ from casadi import SX, vertcat, horzcat, diag, sqrt, if_else
 import do_mpc
 import cvxpy as cp # Import the cvxpy library for QP solving
 import time
+import matplotlib
+matplotlib.rc('pdf', fonttype=42)
+plt.rcParams["font.family"] = "serif"
+plt.rc('axes', titlesize=18)
+plt.rc("axes", labelsize=18)
+plt.rc('xtick', labelsize=18)
+plt.rc('ytick', labelsize=18)
 
 # --- Helper classes and functions from the original code ---
 # (build_discrete_cable_model and build_mpc are not used by the new controller
@@ -232,6 +239,8 @@ class CableRobotSystem:
         if res.fun > 1e-3:
             # This is expected during dynamic motion, not an error
             print(f"Warning: High constraint violation {res.fun:.6f} when projecting hitch position.")
+            for i in range(4):
+                self.p_i[i, :] = 0.99*self.p_i[i, :] + 0.01*self.p
 
         p_corrected = res.x
 
@@ -1042,7 +1051,7 @@ def get_robot_refs_from_ellipsoids(p_ref, v_ref, n12_ref, v_n12_ref, n34_ref, v_
         sign = (-1)**(i) # for i=0,1 gives 1,-1; for i=2,3 gives 1,-1
 
         # Full offset vector from Eq. (18)
-        offset = (d_ref / 2.0) * (-n_ref / denom + sign * cross_term)
+        offset = (d_ref / 2.0) * (-n_ref / denom - sign * cross_term)
         p_i_ref[i] = p_ref + offset
 
         # --- Velocity Calculation (Time Derivative of the above) ---
@@ -1077,24 +1086,6 @@ def robot_traj_from_ellipsoids(t):
     Generates a sample trajectory for the ellipsoid properties and computes
     the corresponding robot reference positions and velocities.
     """
-    # --- Generate Reference Trajectory for Ellipsoid Properties ---
-    # 1. Hitch Point Trajectory (e.g., oscillating)
-    HITCH_MAG1, HITCH_MAG2, HITCH_MAG3 = 0.6, 0.5, 0.0
-    HITCH_FREQ1, HITCH_FREQ2, HITCH_FREQ3 = 0.4, 0.4, 0.0
-    D12_OFFSET = 3.8 # Average length
-    D12_MAG = 0.2    # Oscillation amplitude
-    D12_FREQ = 0.5   # Oscillation frequency (rad/s)
-
-    # Parameters for d34 (major axis length of ellipsoid 3-4)
-    D34_OFFSET = 3.5 # Average length
-    D34_MAG = 0.3    # Oscillation amplitude
-    D34_FREQ = 0.8   # Oscillation frequency (rad/s)
-    
-    # Constant angular velocity for the normal vectors' rotation
-    YAW_DOT_REF = 0.3 # rad/s
-
-    # --- Generate Reference Trajectory for Ellipsoid Properties ---
-    
     # 1. Hitch Point Trajectory (e.g., oscillating)
     p_ref = np.array([HITCH_MAG1 * np.cos(HITCH_FREQ1 * t), 
                       HITCH_MAG2 * np.sin(HITCH_FREQ2 * t - 1.0), 
@@ -1114,9 +1105,9 @@ def robot_traj_from_ellipsoids(t):
     angle = YAW_DOT_REF * t
     angle_dot = YAW_DOT_REF # The constant velocity
 
-    n12_ref = np.array([1.4*np.cos(angle), 1.4*np.sin(angle), 0.])
+    n12_ref = (1.414 + N12_RAND) * (np.array([np.cos(angle), np.sin(angle), 0.]))
     # For equilibrium, n34 should be collinear and opposite to n12
-    n34_ref = -n12_ref
+    n34_ref = -(1 + N34_RAND) * n12_ref
 
     # Time derivatives of the normal vectors
     v_n12_ref = angle_dot * np.array([-np.sin(angle), np.cos(angle), 0.])
@@ -1135,19 +1126,20 @@ def robot_traj_from_ellipsoids(t):
 def main():
     n = N # Switch to 3 for 3D
     dt = DT
-    steps = 5000
+    steps = STEPS
 
+    shift = np.random.normal(0, 1.0, (3,))
     p_i0 = np.array([
-        [-1.5, -1.8, -0.25],
-        [-2.0,  2.3, 0.25],
-        [ 2.0,  2.2, -0.35],
-        [ 1.5, -1.9, 0.20]
-    ])[:, :n]
+        [-1.8, -2.0, -0.25] + shift,
+        [-2.0,  2.3, 0.25] + shift,
+        [ 2.0,  2.2, -0.35] + shift,
+        [ 2.1, -1.9, 0.20] + shift
+    ])[:, :n] + np.random.normal(0, 0.15, (4, 3))[:, :n]
 
     v_i0 = np.random.normal(0, 0.05, (4, 3))[:, :n]
     # v_i0[:, 1] = -0.2 # Give a small initial upward velocity to avoid singularity
-    m = 0.001
-    m_i = np.ones(4) * 0.1
+    m = 0.005
+    m_i = np.ones(4) * 0.35
     l12 = L12
     l34 = L34
     c_d = 0.2 # Damping coefficient
@@ -1177,7 +1169,7 @@ def main():
     sim.d34_ref = np.sqrt(2) * l34/2
     
     sim.v_i_ref = np.zeros((4, n))
-    sim.f_ext = np.array([0.0, 0.0, -2 * m])[:n] # Gravity force on the payload
+    sim.f_ext = np.array([0.0, 0.0, 0.0 * m])[:n] # Gravity force on the payload
     sim.clf_params = {
         'K_p': np.diag([5.0] * n),      # Proportional gain for hitch error
         'K_n': np.diag([0.5] * n),       # Gain for normal vector error
@@ -1190,7 +1182,7 @@ def main():
         'beta': 10.0,                          # HOCBF parameter for q_i
         'lambda': 100.0,                        # HOCBF parameter for psi_i
         't_min': 0.1,                         # Minimum desired cable tension (CBF)
-        'u_max': 100.0,                         # Max control input magnitude
+        'u_max': 20.0,                         # Max control input magnitude
         'Kp_robot': np.diag([10.0] * n),  # Robot position CLF gain
         'Kv_robot': np.diag([20.0] * n),  # Robot velocity CLF gain
     }
@@ -1204,13 +1196,109 @@ def main():
         sim.run(steps, ref_trajectory, controller_type=controller,verbose=False)
     except KeyboardInterrupt:
         print("Simulation interrupted by user.")
-    sim.animate(frame_skip=19)
+
+    V_hist = np.array(sim.history["V"]).copy()
+    Err_hist = np.array(sim.history["error_mag_sum"]).copy()
+    Lyapunov_function_history.append(V_hist)
+    Error_history.append(Err_hist)
+    # sim.animate(frame_skip=19)
 
 if __name__ == "__main__":
     SOLVER = cp.OSQP
-    L12 = 5.8
-    L34 = 5.5
-    N = 3
-    DT = 0.01
-    main()
+    L12 = 6.2
+    L34 = 5.8
+    N = 2
+    DT = 0.005
+    STEPS = 2000
+    param_sets = [
+        # Set 0: Static Targets
+        {
+            "HITCH_MAG": (0.0, 0.0, 0.0),
+            "HITCH_FREQ": (0.0, 0.0, 0.0),
+            "D12_MAG": 0.0,
+            "D12_FREQ": 0.0,
+            "D34_MAG": 0.0,
+            "D34_FREQ": 0.0,
+            "YAW_DOT_REF": 0.0,
+        },
+        # Set 1: Dynamic Targets
+        {
+            "HITCH_MAG": (0.6, 0.5, 0.0),
+            "HITCH_FREQ": (0.4, 0.4, 0.0),
+            "D12_MAG": 0.2,
+            "D12_FREQ": 0.5,
+            "D34_MAG": 0.3,
+            "D34_FREQ": 0.8,
+            "YAW_DOT_REF": 0.3,
+        }
+    ]
+    # # 1. Hitch Point Trajectory (e.g., oscillating)
+    # HITCH_MAG1, HITCH_MAG2, HITCH_MAG3 = 0.0, 0.0, 0.0 # 0.6, 0.5, 0.0
+    # HITCH_FREQ1, HITCH_FREQ2, HITCH_FREQ3 = 0.0, 0.0, 0.0 #0.4, 0.4, 0.0
 
+    N12_RAND = np.random.normal(0, 0.01) # 0.0 # Noise magnitude for n12
+    N34_RAND = np.random.normal(0, 0.01) # 0.0 # Noise magnitude for n34
+
+    D12_OFFSET = L12/np.sqrt(2) - N12_RAND # Average length
+    # D12_MAG = 0.0 #0.2    # Oscillation amplitude
+    # D12_FREQ = 0.0 #0.5   # Oscillation frequency (rad/s)
+
+    # # Parameters for d34 (major axis length of ellipsoid 3-4)
+    D34_OFFSET = L34/np.sqrt(2) - (N12_RAND + N34_RAND) # Average length
+    # D34_MAG = 0.0 # 0.3    # Oscillation amplitude
+    # D34_FREQ = 0.0 # 0.8   # Oscillation frequency (rad/s)
+    
+    # # Constant angular velocity for the normal vectors' rotation
+    # YAW_DOT_REF = 0.0 # rad/s
+    for index, active_params in enumerate(param_sets):
+        HITCH_MAG1, HITCH_MAG2, HITCH_MAG3 = active_params["HITCH_MAG"]
+        HITCH_FREQ1, HITCH_FREQ2, HITCH_FREQ3 = active_params["HITCH_FREQ"]
+        D12_MAG = active_params["D12_MAG"]
+        D12_FREQ = active_params["D12_FREQ"]
+        D34_MAG = active_params["D34_MAG"]
+        D34_FREQ = active_params["D34_FREQ"]
+        YAW_DOT_REF = active_params["YAW_DOT_REF"]
+        STEPS = int(2000 + index*4000) 
+        for dim in [2, 3]:
+            N = dim
+            Lyapunov_function_history = []
+            Error_history = []
+            for _ in range(3): # Run multiple simulations
+                main()
+
+            # plot Lyapunov function and error history mean, distribution, and extremities over time, with shaded error bars
+            V_hist_mean = np.mean(np.array([vh for vh in Lyapunov_function_history if len(vh) > 0]), axis=0)
+            V_hist_min = np.min(np.array([vh for vh in Lyapunov_function_history if len(vh) > 0]), axis=0)
+            V_hist_max = np.max(np.array([vh for vh in Lyapunov_function_history if len(vh) > 0]), axis=0)
+            V_hist_std = np.std(np.array([vh for vh in Lyapunov_function_history if len(vh) > 0]), axis=0)
+            Err_hist_mean = np.mean(np.array([eh for eh in Error_history if len(eh) > 0]), axis=0)
+            Err_hist_min = np.min(np.array([eh for eh in Error_history if len(eh) > 0]), axis=0)
+            Err_hist_max = np.max(np.array([eh for eh in Error_history if len(eh) > 0]), axis=0)
+            Err_hist_std = np.std(np.array([eh for eh in Error_history if len(eh) > 0]), axis=0)
+            time_array = np.array(range(len(V_hist_mean)))*DT
+            fig_v, ax_v = plt.subplots(figsize=(12, 6))
+            ax_v.set_title("Lyapunov function Over Time")
+            ax_v.set_xlabel("Time (s))")
+            ax_v.set_ylabel("V")
+            ax_v.set_ylim([0, V_hist_mean.max() + V_hist_std.max()*2.0])
+            ax_v.set_xlim([0, DT*STEPS])
+            ax_v.plot(time_array, V_hist_mean, 'b-', label='Mean V')
+            ax_v.fill_between(time_array, V_hist_mean - V_hist_std, V_hist_mean + V_hist_std, color='b', alpha=0.2, label='±1 Std Dev')
+            ax_v.fill_between(time_array, V_hist_min, V_hist_max, color='b', alpha=0.1, label='Min-Max Range')
+            ax_v.grid(True, linestyle='--', alpha=0.6)  
+            ax_v.legend(fontsize=18)
+            plt.savefig(f"Lyapunov_function_over_time_{N}D_{index}.pdf")
+
+            ax_err = plt.subplots(figsize=(12, 6))[1]
+            ax_err.set_title("Error sum Over Time")
+            ax_err.set_xlabel("Time (s))")
+            ax_err.set_ylabel("Error Sum")
+            ax_err.set_ylim([0, Err_hist_mean.max() + Err_hist_std.max()*2.0])
+            ax_err.set_xlim([0, DT*STEPS])
+            ax_err.plot(time_array, Err_hist_mean, 'r-', label='Mean Error Sum')
+            ax_err.fill_between(time_array, Err_hist_mean - Err_hist_std, Err_hist_mean + Err_hist_std, color='r', alpha=0.2, label='±1 Std Dev')
+            ax_err.fill_between(time_array, Err_hist_min, Err_hist_max, color='r', alpha=0.1, label='Min-Max Range')
+            ax_err.grid(True, linestyle='--', alpha=0.6)
+            ax_err.legend(fontsize=18)
+            plt.savefig(f"Error_sum_over_time_{N}D_{index}.pdf")
+            
